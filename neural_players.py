@@ -172,7 +172,7 @@ class MCTSNeuralPlayer(NeuralPlayer):
         else:
             # Terminal node evaluation
             result = node.board.get_game_result()
-            if result == self.token:
+            if result == node.player_token:
                 value = 1.0
             elif result == 'D':
                 value = 0.0
@@ -186,19 +186,20 @@ class MCTSNeuralPlayer(NeuralPlayer):
         """Select child using PUCT formula"""
         best_score = -float('inf')
         best_child = None
-        
+
         for child in node.children.values():
             if child.visits == 0:
                 score = float('inf')
             else:
-                exploitation = child.value
+                # Negate child value because it's from opponent's perspective
+                exploitation = -child.value
                 exploration = self.c_puct * child.prior * np.sqrt(node.visits) / (1 + child.visits)
                 score = exploitation + exploration
-            
+
             if score > best_score:
                 best_score = score
                 best_child = child
-        
+
         return best_child
     
     def _expand_and_evaluate(self, node: 'MCTSNode') -> float:
