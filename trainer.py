@@ -12,10 +12,45 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 import time
+import subprocess
+import os
 
 from game import Board, Game
 from neural_players import NeuralPlayer, create_player
 from logger import Logger
+
+
+def get_git_info() -> Dict[str, Any]:
+    """Get git repository information for reproducibility"""
+    try:
+        commit = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'],
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+
+        branch = subprocess.check_output(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+
+        # Check if working directory is dirty
+        dirty = len(subprocess.check_output(
+            ['git', 'status', '--porcelain'],
+            stderr=subprocess.DEVNULL
+        ).decode()) > 0
+
+        return {
+            'commit': commit,
+            'branch': branch,
+            'dirty': dirty
+        }
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Not a git repo or git not available
+        return {
+            'commit': 'unknown',
+            'branch': 'unknown',
+            'dirty': False
+        }
 
 
 class ExperienceBuffer:
@@ -72,30 +107,101 @@ class Trainer:
     """
     Enhanced trainer with better organization and telemetry.
     """
-    
+
     def __init__(self, model, config, logger: Optional[Logger] = None):
         self.model = model
         self.config = config
         self.logger = logger or Logger(config)
-        
+
         # Move model to device
         self.device = torch.device(config.device)
         self.model.to(self.device)
-        
+
         # Setup optimizer
         self.optimizer = self._create_optimizer()
-        
+
         # Setup learning rate scheduler
         self.scheduler = self._create_lr_scheduler() if config.training.use_lr_scheduler else None
-        
+
         # Setup experience buffer
         self.experience_buffer = ExperienceBuffer(config.training.memory_size)
-        
+
         # Training statistics
         self.game_count = 0
         self.training_steps = 0
         self.best_eval_score = 0
-        
+
+        # Initialize Weights & Biases
+        self.use_wandb = config.logging.use_wandb
+        if self.use_wandb:
+            try:
+                import wandb
+                self.wandb = wandb
+
+                # Get git info for reproducibility
+                git_info = get_git_info()
+
+                # Prepare config dict for wandb
+                wandb_config = {
+                    # Model config
+                    'model_type': getattr(config.model, 'type', 'standard'),
+                    'input_size': config.model.input_size,
+                    'hidden_size': config.model.hidden_size,
+                    'num_hidden_layers': config.model.num_hidden_layers,
+                    'activation': config.model.activation,
+                    'use_batch_norm': config.model.use_batch_norm,
+                    'dropout_rate': config.model.dropout_rate,
+
+                    # Training config
+                    'learning_rate': config.training.learning_rate,
+                    'batch_size': config.training.batch_size,
+                    'memory_size': config.training.memory_size,
+                    'num_games': config.training.num_games,
+                    'optimizer': config.training.optimizer,
+                    'weight_decay': config.training.weight_decay,
+                    'gradient_clip': config.training.gradient_clip,
+                    'initial_temperature': config.training.initial_temperature,
+                    'final_temperature': config.training.final_temperature,
+                    'temperature_decay': config.training.temperature_decay,
+                    'policy_loss_weight': config.training.policy_loss_weight,
+                    'value_loss_weight': config.training.value_loss_weight,
+                    'use_augmentation': config.training.use_augmentation,
+                    'use_lr_scheduler': config.training.use_lr_scheduler,
+
+                    # Other settings
+                    'device': config.device,
+                    'seed': config.seed,
+
+                    # Git info
+                    'git_commit': git_info['commit'],
+                    'git_branch': git_info['branch'],
+                    'git_dirty': git_info['dirty'],
+                }
+
+                # Initialize wandb
+                wandb.init(
+                    project=config.logging.wandb_project,
+                    entity=config.logging.wandb_entity,
+                    name=config.logging.wandb_name,
+                    tags=config.logging.wandb_tags,
+                    notes=config.logging.wandb_notes,
+                    config=wandb_config,
+                    mode=config.logging.wandb_mode
+                )
+
+                # Watch model for gradient tracking
+                wandb.watch(self.model, log='all', log_freq=100)
+
+                self.logger.logger.info("Weights & Biases initialized successfully")
+                self.logger.logger.info(f"Run URL: {wandb.run.url}")
+
+            except ImportError:
+                self.logger.logger.warning("wandb not installed. Install with: pip install wandb")
+                self.use_wandb = False
+            except Exception as e:
+                self.logger.logger.warning(f"Failed to initialize wandb: {e}")
+                self.use_wandb = False
+
         # Log model architecture
         self.logger.logger.info(self.model.get_architecture_summary())
     
@@ -155,6 +261,15 @@ class Trainer:
             # Log game result
             winner = game_data[-1]['winner'] if game_data else 'D'
             self.logger.log_game_result(winner, game_num, len(game_data), temperature)
+
+            # Log to wandb
+            if self.use_wandb and game_num % self.config.logging.log_metrics_interval == 0:
+                self.wandb.log({
+                    'game': game_num,
+                    'game/moves': len(game_data),
+                    'game/temperature': temperature,
+                    'game/winner': 1 if winner == 'X' else (-1 if winner == 'O' else 0),
+                })
             
             # Training step
             if game_num % self.config.training.games_per_update == 0:
@@ -166,6 +281,13 @@ class Trainer:
                     current_lr = self.optimizer.param_groups[0]['lr']
                     if game_num % 100 == 0:  # Log LR every 100 games
                         self.logger.logger.info(f"Learning rate: {current_lr:.6f}")
+
+                    # Log learning rate to wandb
+                    if self.use_wandb:
+                        self.wandb.log({
+                            'game': game_num,
+                            'hyperparameters/learning_rate': current_lr
+                        })
             
             # Evaluation
             if game_num % self.config.evaluation.eval_interval == 0:
@@ -178,9 +300,14 @@ class Trainer:
         # Final evaluation
         self._evaluate()
         self._save_checkpoint()
-        
+
         # Log summary
         self.logger.log_summary()
+
+        # Finish wandb run
+        if self.use_wandb:
+            self.wandb.finish()
+
         self.logger.close()
     
     def _calculate_temperature(self, game_num: int) -> float:
@@ -303,15 +430,15 @@ class Trainer:
         """Perform training updates"""
         if len(self.experience_buffer) < self.config.training.batch_size:
             return
-        
+
         losses = []
-        
+
         for _ in range(self.config.training.updates_per_training):
             loss_dict = self._train_step()
             if loss_dict:
                 losses.append(loss_dict)
                 self.training_steps += 1
-        
+
         # Log average losses
         if losses:
             avg_losses = {
@@ -319,8 +446,23 @@ class Trainer:
                 'policy': np.mean([l['policy'] for l in losses]),
                 'value': np.mean([l['value'] for l in losses])
             }
-            self.logger.log_training_step(avg_losses, self.game_count, 
+            self.logger.log_training_step(avg_losses, self.game_count,
                                          self.config.training.batch_size)
+
+            # Log to wandb
+            if self.use_wandb:
+                buffer_stats = self.experience_buffer.get_stats()
+                self.wandb.log({
+                    'game': self.game_count,
+                    'training_step': self.training_steps,
+                    'loss/total': avg_losses['total'],
+                    'loss/policy': avg_losses['policy'],
+                    'loss/value': avg_losses['value'],
+                    'buffer/size': buffer_stats['size'],
+                    'buffer/occupancy': buffer_stats['occupancy'],
+                    'buffer/value_mean': buffer_stats.get('value_mean', 0),
+                    'buffer/win_rate': buffer_stats.get('win_rate', 0),
+                })
     
     def _train_step(self) -> Optional[Dict[str, float]]:
         """Single training step"""
@@ -368,14 +510,27 @@ class Trainer:
     def _evaluate(self):
         """Evaluate model performance"""
         eval_results = {}
-        
+
         for opponent_type in self.config.evaluation.opponents:
             results = self._evaluate_against(opponent_type)
             eval_results[opponent_type] = results
-        
+
         # Log evaluation results
         self.logger.log_evaluation(eval_results, self.game_count)
-        
+
+        # Log to wandb
+        if self.use_wandb:
+            wandb_metrics = {'game': self.game_count}
+            for opponent_type, results in eval_results.items():
+                prefix = f'eval/{opponent_type}'
+                wandb_metrics.update({
+                    f'{prefix}/win_rate': results['win_rate'],
+                    f'{prefix}/loss_rate': results['loss_rate'],
+                    f'{prefix}/draw_rate': results['draw_rate'],
+                    f'{prefix}/avg_moves': results['avg_moves'],
+                })
+            self.wandb.log(wandb_metrics)
+
         # Update best model if improved
         if 'random' in eval_results:
             score = eval_results['random']['win_rate']
@@ -409,21 +564,22 @@ class Trainer:
             # Alternate who goes first
             if _ % 2 == 0:
                 result = game.play(neural_player, opponent)
-                if result['winner'] == 'X':
+                if result['winner'] == neural_player.token:
                     results['wins'] += 1
-                elif result['winner'] == 'O':
+                elif result['winner'] == opponent.token:
                     results['losses'] += 1
                 else:
                     results['draws'] += 1
             else:
                 result = game.play(opponent, neural_player)
-                if result['winner'] == 'O':
+                # When opponent goes first, check tokens correctly
+                if result['winner'] == neural_player.token:
                     results['wins'] += 1
-                elif result['winner'] == 'X':
+                elif result['winner'] == opponent.token:
                     results['losses'] += 1
                 else:
                     results['draws'] += 1
-            
+
             results['total_moves'] += result['moves']
         
         # Calculate statistics
@@ -453,8 +609,23 @@ class Trainer:
             'game_num': self.game_count,
             'config': self.config
         }, best_path)
-        
+
         self.logger.logger.info(f"New best model saved with score: {self.best_eval_score:.1%}")
+
+        # Save to wandb as artifact
+        if self.use_wandb:
+            artifact = self.wandb.Artifact(
+                name=f'model-{self.wandb.run.id}',
+                type='model',
+                description=f'Best model at game {self.game_count} with win rate {self.best_eval_score:.1%}',
+                metadata={
+                    'game_num': self.game_count,
+                    'eval_score': self.best_eval_score,
+                    'win_rate': self.best_eval_score,
+                }
+            )
+            artifact.add_file(str(best_path))
+            self.wandb.log_artifact(artifact)
     
     def resume_from_checkpoint(self, checkpoint_path: str):
         """Resume training from a checkpoint"""

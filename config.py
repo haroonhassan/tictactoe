@@ -87,6 +87,15 @@ class LoggingConfig:
     use_tensorboard: bool = True
     tensorboard_dir: str = "runs"
 
+    # Weights & Biases settings
+    use_wandb: bool = True
+    wandb_project: str = "tictactoe-rl"
+    wandb_entity: Optional[str] = None  # Your wandb username/team (None = default)
+    wandb_name: Optional[str] = None  # Experiment name (None = auto-generated)
+    wandb_tags: list = field(default_factory=list)  # Tags for organizing experiments
+    wandb_notes: str = ""  # Description/notes for this run
+    wandb_mode: str = "online"  # "online", "offline", or "disabled"
+
     # Checkpoint settings
     checkpoint_dir: str = "checkpoints"
     checkpoint_interval: int = 100

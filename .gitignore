@@ -36,6 +36,11 @@ logs/
 data/
 datasets/
 
+# Experiment tracking
+wandb/
+.wandb/
+runs/
+
 # Editor files
 *.swp
 *.swo

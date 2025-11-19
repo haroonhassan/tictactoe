@@ -1,0 +1,10 @@
+# Core dependencies
+torch>=2.0.0
+numpy>=1.24.0
+
+# Experiment tracking
+wandb>=0.16.0
+
+# Optional but recommended
+matplotlib>=3.7.0
+tensorboard>=2.14.0
